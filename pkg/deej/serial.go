@@ -66,7 +66,7 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 }
 
 // Start attempts to connect to our arduino chip
-func (sio *SerialIO) Start() error {
+func (sio *SerialIO) Start(reconnecting bool) error {
 
 	// don't allow multiple concurrent connections
 	if sio.connected {
@@ -97,11 +97,20 @@ func (sio *SerialIO) Start() error {
 
 	var err error
 	sio.conn, err = serial.Open(sio.connOptions)
-	if err != nil {
 
-		// might need a user notification here, TBD
-		sio.logger.Warnw("Failed to open serial connection", "error", err)
-		return fmt.Errorf("open serial connection: %w", err)
+	if err != nil {
+		if reconnecting {
+			fmt.Println("Failed to open serial connection, retrying in 5 seconds.")
+			time.Sleep(5 * time.Second)
+			sio.Start(true)
+			return fmt.Errorf("open serial connection: %w", err)
+
+		} else {
+			// might need a user notification here, TBD
+			sio.logger.Warnw("Failed to open serial connection", "error", err)
+			return fmt.Errorf("open serial connection: %w", err)
+		}
+
 	}
 
 	namedLogger := sio.logger.Named(strings.ToLower(sio.connOptions.PortName))
@@ -113,13 +122,25 @@ func (sio *SerialIO) Start() error {
 	go func() {
 		connReader := bufio.NewReader(sio.conn)
 		lineChannel := sio.readLine(namedLogger, connReader)
+		latestLine := time.Now()
 
 		for {
 			select {
 			case <-sio.stopChannel:
 				sio.close(namedLogger)
 			case line := <-lineChannel:
+				latestLine = time.Now()
 				sio.handleLine(namedLogger, line)
+			default:
+				elapsed := time.Since(latestLine)
+				// if we haven't received a line in 10 seconds, restart the connection
+				if elapsed > 10*time.Second {
+					fmt.Println("More than 10 seconds have elapsed.")
+					sio.close(namedLogger)
+					sio.Start(true)
+					return
+				}
+
 			}
 		}
 	}()
@@ -176,7 +197,7 @@ func (sio *SerialIO) setupOnConfigReload() {
 					// let the connection close
 					<-time.After(stopDelay)
 
-					if err := sio.Start(); err != nil {
+					if err := sio.Start(false); err != nil {
 						sio.logger.Warnw("Failed to renew connection after parameter change", "error", err)
 					} else {
 						sio.logger.Debug("Renewed connection successfully")
